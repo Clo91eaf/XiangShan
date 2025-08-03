@@ -18,6 +18,8 @@ package xiangshan.mem
 import org.chipsalliance.cde.config._
 import chisel3._
 import chisel3.util._
+import chisel3.ltl.Property.{eventually, not}
+import chisel3.ltl.{AssertProperty, AssumeProperty, CoverProperty, Delay, Sequence, Property}
 import utils._
 import utility._
 import xiangshan._
@@ -269,6 +271,63 @@ class LoadQueueRAR(implicit p: Parameters) extends XSModule
 
   io.lqFull := freeList.io.empty
   io.validCount := freeList.io.validCount
+
+  // formal verification
+  // Assume Property
+  import Sequence._
+  val controlValid: Sequence = !io.redirect.valid && (io.ldWbPtr.value === 0.U) && !io.ldWbPtr.flag
+  val dataValid: Sequence =  io.query.map(_.req.bits.uop.lqIdx.value > 0.U).reduce(_ && _)
+  val flagValid: Sequence = io.query.map(!_.req.bits.uop.lqIdx.flag).reduce(_ && _)
+  val addressConflict: Sequence = (io.release.bits.paddr(PAddrBits-1, 4) === 0.U) && (io.query(0).req.bits.paddr(PAddrBits-1, 4) === 0.U)
+
+  AssumeProperty(
+    controlValid and dataValid and flagValid and addressConflict,
+    label = Some("LoadQueueRAR control data flag and release should be valid when redirect happens")
+  )
+
+  // Assert Property
+  val fire: Sequence = io.query(0).resp.valid && io.query(0).req.ready
+  val notFire: Sequence = !(io.query(0).resp.valid && io.query(0).req.ready)
+  val query0Revoke: Sequence = !io.query(0).revoke
+  AssertProperty(
+    fire |=> query0Revoke.delay(2),
+    label = Some("LoadQueueRAR query should not be revoked after load query resp")
+  )
+
+  val releaseValid: Sequence = io.release.valid
+  val releaseAddressConflict: Sequence = io.release.bits.paddr(3, 0) === io.query(0).req.bits.paddr(3, 0)
+  AssertProperty(
+    fire |=> (releaseValid and releaseAddressConflict).delayAtLeast(2),
+    label = Some("LoadQueueRAR release should happen after load query resp")
+  )
+
+  val query0valid: Sequence = io.query(0).req.valid
+  val query0ready: Sequence = io.query(0).req.ready
+  val sameAddress: Sequence = io.query(0).req.bits.paddr(3, 0) === io.query(0).req.bits.paddr(3, 0)
+  AssertProperty(
+    fire |=> (query0valid and query0ready and sameAddress).delayAtLeast(3),
+    label = Some("LoadQueueRAR load query should be valid and ready after load query resp")
+  )
+
+  val flag: Sequence = io.query(0).req.bits.uop.robIdx.flag
+  val flagNotKeep: Property = (flag and not(flag.delayAtLeast(3))) or (not(flag) and flag.delayAtLeast(3)) // xor
+
+  val value = io.query(0).req.bits.uop.robIdx.value
+  val size = log2Up(p(XSCoreParamsKey).RobSize)
+  val valueNotKeep: Property = (0 until size).map { i =>
+    (value(i) and not(value(i).delayAtLeast(3))) or (not(value(i)) and value(i).delayAtLeast(3))
+  }.reduce(_ or _)
+  AssertProperty(
+    fire |=> (flagNotKeep and not(valueNotKeep)) or (not(flagNotKeep) and valueNotKeep),
+    label = Some("LoadQueueRAR not keep same flag after load query resp")
+  )
+
+  val query0resp: Sequence = io.query(0).resp.valid
+  val query0frmFetch: Sequence = io.query(0).resp.bits.rep_frm_fetch
+  AssertProperty(
+    fire |=> (query0resp and query0frmFetch).delay(2),
+    label = Some("LoadQueueRAR load query resp should be valid and rep_frm_fetch after load query resp")
+  )
 
   // perf cnt
   val canEnqCount = PopCount(io.query.map(_.req.fire))
